@@ -5,49 +5,23 @@ import requests
 import folium
 from streamlit_folium import st_folium
 import base64
-import sqlite3
 
 # ==========================================
-# 1. DATABASE SETUP (إعداد قاعدة البيانات)
+# 1. FILE-BASED STORAGE SETUP (إعداد حفظ البيانات في ملف)
 # ==========================================
-DB_FILE = "student_greenpulse.db"
+# We store the reports in a local CSV file instead of SQLite.
+# This makes it easier to inspect, backup, and deploy without DB drivers.
+DATA_FILE = "reports.csv"
 IMAGE_DIR = "uploaded_images"
 
 # Ensure directories exist
 if not os.path.exists(IMAGE_DIR):
     os.makedirs(IMAGE_DIR)
 
-# Initialize SQLite Connection
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = conn.cursor()
-
-# We use a single table with a 'type' column to store both Heat Reports and Tree Proposals
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT,
-        region TEXT,
-        latitude REAL,
-        longitude REAL,
-        temperature REAL,
-        description TEXT,
-        image_path TEXT
-    )
-""")
-conn.commit()
-
-# Ensure backwards compatibility (add missing columns if using an older database)
-try:
-    cursor.execute("SELECT region FROM reports LIMIT 1")
-except sqlite3.OperationalError:
-    cursor.execute("ALTER TABLE reports ADD COLUMN region TEXT DEFAULT ''")
-    conn.commit()
-
-try:
-    cursor.execute("SELECT image_path FROM reports LIMIT 1")
-except sqlite3.OperationalError:
-    cursor.execute("ALTER TABLE reports ADD COLUMN image_path TEXT DEFAULT ''")
-    conn.commit()
+# Check if the CSV file exists. If not, initialize it with the required column headers.
+if not os.path.exists(DATA_FILE):
+    df = pd.DataFrame(columns=["id", "type", "region", "latitude", "longitude", "temperature", "description", "image_path"])
+    df.to_csv(DATA_FILE, index=False)
 
 # Predefined Beirut neighborhoods and their coordinates in English for auto-fill support
 BEIRUT_REGIONS = {
@@ -129,9 +103,14 @@ BEIRUT_REGIONS = {
 }
 
 def load_data():
-    """Load the environmental reports from the SQLite database as a Pandas DataFrame."""
+    """Load the environmental reports from the CSV file as a Pandas DataFrame."""
     try:
-        df = pd.read_sql_query("SELECT id, type, region, latitude, longitude, temperature, description, image_path FROM reports", conn)
+        df = pd.read_csv(DATA_FILE)
+        # Ensure region and image_path columns exist for backward compatibility with older CSVs
+        if "region" not in df.columns:
+            df["region"] = ""
+        if "image_path" not in df.columns:
+            df["image_path"] = ""
         # Force column types to ensure consistency during calculations and map rendering
         df["id"] = df["id"].astype(int)
         df["type"] = df["type"].astype(str)
@@ -143,8 +122,12 @@ def load_data():
         df["image_path"] = df["image_path"].fillna("").astype(str)
         return df
     except Exception:
-        # Return an empty DataFrame with the correct schema if query fails
+        # Return an empty DataFrame with the correct schema if reading fails
         return pd.DataFrame(columns=["id", "type", "region", "latitude", "longitude", "temperature", "description", "image_path"])
+
+def save_data(df):
+    """Save the environmental reports back to the CSV file."""
+    df.to_csv(DATA_FILE, index=False)
 
 def get_image_base64(filepath):
     """Read a local file and return its base64 encoded string."""
@@ -286,17 +269,11 @@ elif page == "📝 Submit Form":
     if submit_button:
         db_type = "heat" if report_type == "Heat Stress Report 🌡️" else "tree"
         
-        # Get next ID to name the image file properly
-        cursor.execute("SELECT seq FROM sqlite_sequence WHERE name='reports'")
-        seq_row = cursor.fetchone()
-        next_id = (seq_row[0] + 1) if seq_row else 1
-        # Fallback if sequence is not present
-        cursor.execute("SELECT MAX(id) FROM reports")
-        max_id_row = cursor.fetchone()
-        if max_id_row and max_id_row[0] is not None:
-            next_id = max_id_row[0] + 1
-        else:
-            next_id = 1
+        # Load current records from the CSV file
+        df = load_data()
+        
+        # Generate the next auto-increment ID
+        next_id = int(df["id"].max() + 1) if not df.empty else 1
         
         # Save uploaded image to disk if provided
         image_path = ""
@@ -309,14 +286,23 @@ elif page == "📝 Submit Form":
             with open(image_path, "wb") as f:
                 f.write(uploaded_image.getbuffer())
         
-        # Insert into SQLite database directly
-        cursor.execute(
-            "INSERT INTO reports (type, region, latitude, longitude, temperature, description, image_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (db_type, selected_region, lat, lon, temp, desc, image_path)
-        )
-        conn.commit()
+        # Construct the new report record
+        new_row = pd.DataFrame([{
+            "id": next_id,
+            "type": db_type,
+            "region": selected_region,
+            "latitude": lat,
+            "longitude": lon,
+            "temperature": temp,
+            "description": desc,
+            "image_path": image_path
+        }])
         
-        st.success(f"✅ {report_type} saved to database successfully!")
+        # Append and save the updated data to the CSV file
+        df = pd.concat([df, new_row], ignore_index=True)
+        save_data(df)
+        
+        st.success(f"✅ {report_type} saved to file successfully!")
 
 # ==========================================
 # VIEW 3: CLIMATE ANALYTICS (الإحصائيات)
@@ -412,11 +398,11 @@ elif page == "📊 Climate Analytics":
 # VIEW 4: ADMIN CONTROL (إدارة وحذف البيانات)
 # ==========================================
 elif page == "🗑️ Admin Control":
-    st.title("🗑️ Admin Database Control")
-    st.write("View all entries and delete incorrect submissions from the SQLite database.")
+    st.title("🗑️ Admin File Control")
+    st.write("View all entries and delete incorrect submissions from the CSV file.")
     st.write("---")
 
-    # Load reports from SQLite for management
+    # Load reports from CSV for management
     df = load_data()
 
     if not df.empty:
@@ -445,15 +431,15 @@ elif page == "🗑️ Admin Control":
                             os.remove(str(row["image_path"]))
                         except Exception:
                             pass
-                # Delete from SQLite database
-                cursor.execute("DELETE FROM reports WHERE id = ?", (row['id'],))
-                conn.commit()
+                # Filter out the record from the DataFrame
+                df = df[df["id"] != row['id']]
+                save_data(df)
                 st.success(f"Successfully deleted entry ID {int(row['id'])}!")
                 st.rerun()
             
             st.write("---")
             
-        # Danger zone button to wipe database records
+        # Danger zone button to wipe file records
         st.subheader("🚨 Danger Zone")
         if st.button("Delete All Data ☠️"):
             # Delete all uploaded images
@@ -463,11 +449,10 @@ elif page == "🗑️ Admin Control":
                         os.remove(os.path.join(IMAGE_DIR, img_file))
                     except Exception:
                         pass
-            # Clear database table and reset autoincrement sequence
-            cursor.execute("DELETE FROM reports")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='reports'")
-            conn.commit()
-            st.warning("All records and uploaded images have been cleared from the database!")
+            # Empty DataFrame with headers
+            df = pd.DataFrame(columns=["id", "type", "region", "latitude", "longitude", "temperature", "description", "image_path"])
+            save_data(df)
+            st.warning("All records and uploaded images have been cleared!")
             st.rerun()
     else:
-        st.info("The database is currently empty. No entries to manage.")
+        st.info("The data file is currently empty. No entries to manage.")
